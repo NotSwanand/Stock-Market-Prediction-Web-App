@@ -38,7 +38,11 @@ A Flask-based web application that predicts stock market trends using ARIMA and 
    ```bash
    git clone https://github.com/your-username/stock-market-prediction-web-app.git
    cd stock-market-prediction-web-app
-2. **Add your API keys**
+2. **Install Dependencies**
+   ```
+   pip install requirements.txt
+   ```
+3. **Add your API keys**
 
 Create a constants.py file and include:
 ```
@@ -49,7 +53,7 @@ ACCESS_TOKEN_SECRET = "your_token_secret"
 BEARER_TOKEN = "your_bearer_token"
 NUM_OF_TWEETS = 100  # or any number
 ```
-3. **Run the app**
+4. **Run the app**
 ```
 python main.py``
 ```
