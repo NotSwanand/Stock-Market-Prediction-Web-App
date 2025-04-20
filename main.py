@@ -24,6 +24,7 @@ import re
 from sklearn.linear_model import LinearRegression
 from textblob import TextBlob
 import constants as ct
+import csv
 from Tweet import Tweet
 import nltk
 nltk.download('punkt')
@@ -74,13 +75,10 @@ def index():
 
 # **************** FUNCTION TO FETCH DATA ***************************
 def get_historical(quote):
-    DEMO_MODE = True  # Set this to False for real data
-    
     if DEMO_MODE:
         # Generate fake realistic-looking demo data
         dates = pd.date_range(end=datetime.now(), periods=500)
         base_price = np.random.uniform(100, 200)
-        
         return pd.DataFrame({
             'date': dates,
             'open': base_price + np.random.randn(500).cumsum(),
@@ -93,28 +91,53 @@ def get_historical(quote):
     
     else:
         try:
-            # Original Yahoo Finance code here
+            # Attempt Yahoo Finance
             end = datetime.now()
-            start = datetime(end.year-2, end.month, end.day)
-            data = yf.download(quote, start=start, end=end)
-            
-            # ... rest of original Yahoo code ...
-            
+            start = datetime(end.year - 2, end.month, end.day)
+            stock = yf.Ticker(quote)
+            data = stock.history(period="2y")
+        
+            if not data.empty:
+                df = data.reset_index()
+                df = df.rename(columns={
+                    'Date': 'date',
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'volume'
+             })
+                df['adj close'] = df['close']  # Add dummy adj close column
+                df.to_csv(f"{quote}.csv", index=False)
+            else:
+                raise ValueError("No data received from Yahoo Finance")
         except Exception as e:
-            # Original Alpha Vantage fallback code here
+            print(f"Yahoo Finance Error: {e}")
+            # Fallback to Alpha Vantage
             try:
-                ts = TimeSeries(key='S1ZOSDNQNZTJHQ29', output_format='pandas')
-                # ... rest of original Alpha Vantage code ...
-                
+                ts = TimeSeries(key='N6A6QT6IBFJOPJ70', output_format='pandas')
+                data, _ = ts.get_daily(symbol=quote, outputsize='full')
+                # Process data to match Yahoo's format
+                data = data.head(503).iloc[::-1].reset_index()
+                df = pd.DataFrame({
+                    'Date': pd.to_datetime(data['date']),
+                    'Open': data['1. open'].astype(float),
+                    'High': data['2. high'].astype(float),
+                    'Low': data['3. low'].astype(float),
+                    'Close': data['4. close'].astype(float),
+                    'Adj Close': data['5. adjusted close'].astype(float),
+                    'Volume': data['6. volume'].astype(int)
+                })
+                df.to_csv(f"{quote}.csv", index=False)
             except Exception as e:
                 print(f"Alpha Vantage Error: {e}")
                 return pd.DataFrame()
+        return df
 
 # **************** INSERT INTO TABLE FUNCTION ***************************
 
 @app.route('/insertintotable', methods=['POST'])
 def insertintotable():
-    DEMO_MODE = True  # Set this to False for real version
     quote = request.form.get('nm') or "AAPL"  # Default to AAPL if empty
 
     if DEMO_MODE:
@@ -226,7 +249,19 @@ def insertintotable():
             df = get_historical(quote)
             if df.empty:
                 return render_template('index.html', error=True)
-            # ... rest of original processing code ...
+            
+            df = pd.read_csv(f'{quote}.csv')
+            today_stock = df.iloc[-1:]
+        
+            # Run prediction algorithms
+            arima_pred, error_arima = ARIMA_ALGO(df)
+            lstm_pred, error_lstm = LSTM_ALGO(df)
+            df, lr_pred, forecast_set, mean, error_lr = LIN_REG_ALGO(df)
+        
+            # Get tweets and sentiment
+            tw_list = get_tweets(quote)
+            # ... rest of sentiment analysis from get_data...
+        
             
         except Exception as e:
             print(f"Error: {str(e)}")
@@ -247,7 +282,8 @@ def ARIMA_ALGO(df):
         # Plot trends
         plt.figure(figsize=(7.2, 4.8), dpi=65)
         plt.plot(df['close'])
-        plt.savefig('static/Trends.png')
+        timestamp = str(int(time.time()))
+        plt.savefig(f'static/ARIMA_{timestamp}.png')
         plt.close()
 
         # Train-test split
@@ -496,7 +532,8 @@ from datetime import datetime, timedelta
 tweet_cache = {}
 
 def get_tweets(symbol):
-    DEMO_MODE = True  # Set this to False for real tweets
+    DEMO_MODE = False  # Set to True to use mock data instead of CSV
+    TWEETS_CSV = 'tweets.csv'
     MOCK_TWEETS = [
         f"Breaking: {symbol} reaches new all-time high! 🚀",
         f"Analysts bullish on {symbol}'s latest earnings report 📈",
@@ -507,55 +544,33 @@ def get_tweets(symbol):
     ]
 
     if DEMO_MODE:
-        # Return mock tweets immediately for demo
-        return MOCK_TWEETS[:3]  # Return first 3 mock tweets
-
-    # Only execute below if DEMO_MODE is False
-    try:
-        if symbol in tweet_cache:
-            cached_time, cached_tweets = tweet_cache[symbol]
-            if datetime.now() - cached_time < timedelta(minutes=120):  # Longer cache
-                return cached_tweets[:6]
-
-        p.set_options(p.OPT.URL, p.OPT.EMOJI, p.OPT.SMILEY)
-        tweets = []
-        
-        # Single API call with error wrapping
-        try:
-            response = client.search_recent_tweets(
-                query=f"({symbol} OR #{symbol}) -is:retweet lang:en",
-                max_results=10,  # Reduced from 50 to be conservative
-                tweet_fields=["created_at"]
-            )
-            
-            if response and response.data:
-                for tweet in response.data:
-                    try:
-                        cleaned = p.clean(tweet.text).strip()
-                        cleaned = cleaned.encode('utf-8', 'ignore').decode('utf-8')
-                        if cleaned and len(cleaned) < 280:  # Add length check
-                            tweets.append(cleaned)
-                    except Exception as e:
-                        print(f"Tweet processing error: {str(e)}")
-                        continue
-                
-                if tweets:
-                    tweet_cache[symbol] = (datetime.now(), tweets)
-                    return tweets[:3]  # Return top 3 tweets only
-
-        except tweepy.TooManyRequests as e:
-            print("Rate limit hit in demo - using cached mock data")
-            return MOCK_TWEETS[:3]  # Fallback to mock tweets
-
-        except Exception as e:
-            print(f"Twitter API error: {str(e)}")
-            return MOCK_TWEETS[:3]  # Fallback to mock tweets
-
-        # Final fallback if all else fails
         return MOCK_TWEETS[:3]
 
+    try:
+        # Read from CSV file
+        tweets = []
+        with open(TWEETS_CSV, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['symbol'].upper() == symbol.upper():
+                    cleaned_tweet = re.sub(r'http\S+', '', row['tweet'])  # Remove URLs
+                    cleaned_tweet = cleaned_tweet.strip()
+                    if len(cleaned_tweet) > 0:
+                        tweets.append(cleaned_tweet)
+        
+        # If found in CSV, return latest 3 tweets
+        if tweets:
+            # Sort by date if needed (assuming date column exists)
+            return tweets[-3:]  # Return most recent 3 tweets
+        
+        # Fallback to mock data if no tweets found in CSV
+        return MOCK_TWEETS[:3]
+
+    except FileNotFoundError:
+        print(f"CSV file {TWEETS_CSV} not found. Using mock data.")
+        return MOCK_TWEETS[:3]
     except Exception as e:
-        print(f"General error in get_tweets: {str(e)}")
+        print(f"Error reading tweets from CSV: {str(e)}")
         return MOCK_TWEETS[:3]
 def generate_sentiment_chart(pos, neg, neutral):
     plt.figure(figsize=(7.2, 4.8), dpi=65)
@@ -669,4 +684,4 @@ os.environ['FLASK_DEBUG'] = '0'  # Force-disable debug mode
 os.environ['WERKZEUG_DEBUG_PIN'] = 'off'  # Disable debug PIN
 
 if __name__ == '__main__':
-    app.run(debug=False, use_reloader=False, extra_files=[])
+    app.run(debug=True, use_reloader=False, extra_files=[])
