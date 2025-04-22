@@ -17,14 +17,11 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import yfinance as yf
 import tweepy
-import sys
-sys.stdout.reconfigure(encoding='utf-8')  # For Windows compatibility
 import preprocessor as p
 import re
 from sklearn.linear_model import LinearRegression
 from textblob import TextBlob
 import constants as ct
-import csv
 from Tweet import Tweet
 import nltk
 nltk.download('punkt')
@@ -44,22 +41,7 @@ client = tweepy.Client(
     access_token=ACCESS_TOKEN,
     access_token_secret=ACCESS_TOKEN_SECRET
 )
-
-DEMO_MODE = False  # Set to False for real version
-MOCK_TWEETS = [
-    "AAPL hits new all-time high! 🚀",
-    "Analysts bullish on Apple's new products 📈",
-    "Breaking: AAPL announces stock split 💥",
-    "iPhone sales exceed expectations 📱",
-    "Tim Cook announces new AI initiatives 🤖",
-    "Apple Park named world's best office 🏆"
-]
-
-try:
-    response = client.search_recent_tweets(query="AAPL", max_results=10)
-    print("Tweets found:", len(response.data))
-except Exception as e:
-    print("Credential Error:", str(e))
+api = tweepy.API(client, wait_on_rate_limit=True)
 
 #To control caching so as to save and retrieve plot figs on client side
 @app.after_request
@@ -75,197 +57,213 @@ def index():
 
 # **************** FUNCTION TO FETCH DATA ***************************
 def get_historical(quote):
-    if DEMO_MODE:
-        # Generate fake realistic-looking demo data
-        dates = pd.date_range(end=datetime.now(), periods=500)
-        base_price = np.random.uniform(100, 200)
-        return pd.DataFrame({
-            'date': dates,
-            'open': base_price + np.random.randn(500).cumsum(),
-            'high': base_price + np.random.randn(500).cumsum() + 5,
-            'low': base_price + np.random.randn(500).cumsum() - 5,
-            'close': base_price + np.random.randn(500).cumsum(),
-            'volume': np.random.randint(1000000, 5000000, 500),
-            'adj close': base_price + np.random.randn(500).cumsum()
-        }).reset_index(drop=True)
-    
-    else:
-        try:
-            # Attempt Yahoo Finance
-            end = datetime.now()
-            start = datetime(end.year - 2, end.month, end.day)
-            stock = yf.Ticker(quote)
-            data = stock.history(period="2y")
+    try:
+        # Try Yahoo Finance first
+        end = datetime.now()
+        start = datetime(end.year-2, end.month, end.day)
+        data = yf.download(quote, start=start, end=end)
         
-            if not data.empty:
-                df = data.reset_index()
-                df = df.rename(columns={
-                    'Date': 'date',
-                    'Open': 'open',
-                    'High': 'high',
-                    'Low': 'low',
-                    'Close': 'close',
-                    'Volume': 'volume'
-             })
-                df['adj close'] = df['close']  # Add dummy adj close column
-                df.to_csv(f"{quote}.csv", index=False)
-            else:
-                raise ValueError("No data received from Yahoo Finance")
+        if data.empty:
+            raise ValueError("Yahoo Finance data empty")
+            
+        # Correct column renaming
+        data.columns = [col.lower() for col in data.columns]
+        if 'adj close' not in data.columns:
+            data['adj close'] = data['close'] 
+        data = data.reset_index()
+        
+        # Ensure critical columns exist
+        if 'close' not in data.columns:
+            raise ValueError(f"Columns after Yahoo fetch: {data.columns}")
+            
+        data.to_csv(f'{quote}.csv', index=False)
+        data.index = data.index.tz_localize(None)  # Remove timezone if causing issues
+        return data
+        
+    except Exception as e:
+        print(f"Yahoo Error: {e}")
+        try:
+            ts = TimeSeries(key='S1ZOSDNQNZTJHQ29', output_format='pandas')
+            data, _ = ts.get_daily(symbol=quote, outputsize='full')  # Use non-premium endpoint
+            if data.empty:
+                raise ValueError("Alpha Vantage data empty")
+            data = data.head(503).iloc[::-1]
+            data = data.reset_index()
+            
+            # Rename columns correctly
+            df = pd.DataFrame()
+            df['date'] = data['date']
+            df['open'] = data['1. open']
+            df['high'] = data['2. high']
+            df['low'] = data['3. low']
+            df['close'] = data['4. close']
+            df['volume'] = data['5. volume']
+            df['adj close'] = df['close']
+            
+            df.to_csv(f'{quote}.csv', index=False)
+            return df
+            
         except Exception as e:
-            print(f"Yahoo Finance Error: {e}")
-            # Fallback to Alpha Vantage
-            try:
-                ts = TimeSeries(key='N6A6QT6IBFJOPJ70', output_format='pandas')
-                data, _ = ts.get_daily(symbol=quote, outputsize='full')
-                # Process data to match Yahoo's format
-                data = data.head(503).iloc[::-1].reset_index()
-                df = pd.DataFrame({
-                    'Date': pd.to_datetime(data['date']),
-                    'Open': data['1. open'].astype(float),
-                    'High': data['2. high'].astype(float),
-                    'Low': data['3. low'].astype(float),
-                    'Close': data['4. close'].astype(float),
-                    'Adj Close': data['5. adjusted close'].astype(float),
-                    'Volume': data['6. volume'].astype(int)
-                })
-                df.to_csv(f"{quote}.csv", index=False)
-            except Exception as e:
-                print(f"Alpha Vantage Error: {e}")
-                return pd.DataFrame()
-        return df
+            print(f"Alpha Vantage Error: {e}")
+            return pd.DataFrame()  # Trigger error handling
 
 # **************** INSERT INTO TABLE FUNCTION ***************************
-
 @app.route('/insertintotable', methods=['POST'])
 def insertintotable():
-    quote = request.form.get('nm') or "AAPL"  # Default to AAPL if empty
+    # Get the stock symbol from form data
+    quote = request.form.get('nm')
+    
+    # Validate input
+    if not quote:
+        return redirect(url_for('index'))
+    
+    try:
+        # Fetch historical stock data
+        df = get_historical(quote)
+        if df.empty:
+            return render_template('index.html', error=True)
+        
+        # Preprocessing
+        df = df.dropna()
+        code_list = [quote] * len(df)
+        df2 = pd.DataFrame(code_list, columns=['Code'])
+        df2 = pd.concat([df2, df], axis=1)
+        df = df2
 
-    if DEMO_MODE:
-        # MODIFIED SECTION START (for dynamic sentiment analysis)
-        # Generate realistic mock price data
-        base_price = round(random.uniform(50, 300), 2)
-        daily_change = random.uniform(-0.03, 0.04)
-        mock_price = round(base_price * (1 + daily_change), 2)
-        mock_error = round(random.uniform(1.5, 4.5), 2)
+        # Run prediction algorithms
+        arima_pred, error_arima = ARIMA_ALGO(df)
+        lstm_pred, error_lstm = LSTM_ALGO(df)
+        df, lr_pred, forecast_set, mean, error_lr = LIN_REG_ALGO(df)
+        
+        # Retrieve today's stock data
+        today_stock = df.iloc[-1:]
+        today_stock = today_stock.round(2)
+        
+        try:
+            tw_list = get_tweets(quote)
+            if not tw_list:
+                raise Exception("No tweets found")
+        
+            analysis = [TextBlob(tweet).sentiment.polarity for tweet in tw_list]
+            polarity = sum(analysis)/len(analysis)
+            pos = len([x for x in analysis if x > 0])
+            neg = len([x for x in analysis if x < 0])
+            neutral = len([x for x in analysis if x == 0])
+            tw_pol = f"Positive: {pos} | Negative: {neg} | Neutral: {neutral}"
 
-        # Create categorized tweets
-        sentiment_tweets = {
+        except Exception as e:
+            print(f"Using demo tweets: {str(e)}")
+    
+            # DEMO TWEETS SYSTEM
+            sentiment_tweets = {
             'positive': [
-        f"{quote} reaches new all-time high! 🚀",
-        f"Analysts raise price target for {quote} 📈",
-        f"{quote} announces major dividend increase 💰",
-        "Record quarterly earnings reported 🏆",
-        f"Institutional investors accumulating {quote} 🧑💼",
-        "New product launch exceeds expectations 🚀",
-        f"{quote} named sector leader by Wall Street 📰",
-        "CEO buys shares in open market 💹"
+                f"{quote} reaches new all-time high! 🚀",
+                f"Analysts raise price target for {quote} 📈",
+                f"{quote} announces major dividend increase 💰",
+                "Record quarterly earnings reported 🏆",
+                f"Institutional investors accumulating {quote} 🧑💼",
+                "New product launch exceeds expectations 🚀",
+                f"{quote} named sector leader by Wall Street 📰",
+                "CEO buys shares in open market 💹"
+                f"{quote} partners with industry giant 🤝",
+                f"Breakthrough technology unveiled by {quote} 🧪"
             ],
             'negative': [
-        f"{quote} faces SEC investigation 🔍",
-        "CFO unexpectedly resigns 😮",
-        f"{quote} misses revenue estimates 📉",
-        "Supply chain disruptions reported ⚠️",
-        "Short sellers increasing positions in {quote} 📉",
-        "Product recall announced ⚠️",
-        "Credit rating downgrade issued 📉",
-        f"Lawsuits filed against {quote} ⚖️"
+                f"{quote} faces SEC investigation 🔍",
+                "CFO unexpectedly resigns 😮",
+                f"{quote} misses revenue estimates 📉",
+                "Supply chain disruptions reported ⚠️",
+                f"Short sellers increasing positions in {quote} 📉",
+                "Product recall announced ⚠️",
+                "Credit rating downgrade issued 📉",
+                f"Lawsuits filed against {quote} ⚖️"
+                "Data breach exposes customer information 🛑",
+                f"{quote} factory operations halted ⚠️"
             ],
             'neutral': [
-        f"{quote} to hold earnings call tomorrow 🎧",
-        "Sector-wide volatility continues 📊",
-        f"{quote} added to watchlist by major fund 👀",
-        "Technical analysis shows mixed signals 📈📉",
-        "Market awaits Fed decision 💼",
-        f"{quote} volume spikes with no clear catalyst 📊",
-        "Institutional ownership remains stable ⚖️",
-        "Analysts debate {quote} valuation 🧑💻"
+                f"{quote} to hold earnings call tomorrow 🎧",
+                "Sector-wide volatility continues 📊",
+                f"{quote} added to watchlist by major fund 👀",
+                "Technical analysis shows mixed signals 📈📉",
+                "Market awaits Fed decision 💼",
+                f"{quote} volume spikes with no clear catalyst 📊",
+                "Institutional ownership remains stable ⚖️",
+                f"Analysts debate {quote} valuation 🧑💻"
+                f"{quote} attends industry conference 🌐",
+                "Share buyback program announced 🔄"
             ]
         }
+    
 
-        # Randomly select 3 tweets with varied sentiment
-        all_tweets = (
-    sentiment_tweets['positive'] + 
-    sentiment_tweets['negative'] + 
-    sentiment_tweets['neutral']
-)
-        tw_list = random.choices(all_tweets, k=5)
+            base_counts = {
+                'positive': 1,
+                'negative': 1,
+                'neutral': 1
+            }
 
-        # Count sentiments
-        pos = sum(1 for t in tw_list if t in sentiment_tweets['positive'])
-        neg = sum(1 for t in tw_list if t in sentiment_tweets['negative'])
-        neutral = sum(1 for t in tw_list if t in sentiment_tweets['neutral'])
+            # 2. Randomly distribute remaining 4 tweets
+            remaining = 7 - sum(base_counts.values())
+            categories = ['positive', 'negative', 'neutral']
 
-        # Generate sentiment chart
-        generate_sentiment_chart(pos, neg, neutral)
+            for _ in range(remaining):
+                chosen_category = random.choice(categories)
+                base_counts[chosen_category] += 1
 
-        # Generate stock metrics
-        today_stock = pd.DataFrame({
-            'open': round(mock_price * (1 + random.uniform(-0.02, 0.02)), 2),
-            'high': round(mock_price * (1 + random.uniform(0.01, 0.05)), 2),
-            'low': round(mock_price * (1 + random.uniform(-0.05, -0.01)), 2),
-            'close': mock_price,
-            'volume': random.randint(1000000, 5000000),
-            'adj close': round(mock_price * (1 + random.uniform(-0.01, 0.01)), 2)
-        }, index=[0])
+            # 3. Select tweets ensuring no duplicates
+            selected_tweets = []
+            for category, count in base_counts.items():
+                available_tweets = sentiment_tweets[category]
+                
+                # Handle case where requested count > available tweets
+                actual_count = min(count, len(available_tweets))
+                
+                if actual_count > 0:
+                    selected = random.sample(available_tweets, actual_count)
+                    selected_tweets.extend(selected)
 
-        # Generate predictions
-        arima_pred = round(mock_price * (1 + random.uniform(-0.03, 0.05)), 2)
-        lstm_pred = round(mock_price * (1 + random.uniform(-0.02, 0.04)), 2)
-        lr_pred = round(mock_price * (1 + random.uniform(-0.01, 0.03)), 2)
-
-        # Generate forecast trend
-       # Generate forecast trend
-# Corrected line (notice the parentheses)
-        forecast_set = [[round(mock_price * (1 + (i/100 * random.choice([1, -1]))), 2)] for i in range(1, 8)]
-
-        # Generate recommendation
-        idea = "RISE" if (pos > neg) else "FALL"
-        decision = "BUY" if idea == "RISE" else "SELL"
-        # MODIFIED SECTION END
-
-        return render_template('results.html',
+            # 4. Shuffle and trim to 7 (in case of overflow from min())
+            random.shuffle(selected_tweets)
+            tw_list = selected_tweets[:7]
+    
+            # Count sentiments
+            pos = sum(1 for t in tw_list if t in sentiment_tweets['positive'])
+            neg = sum(1 for t in tw_list if t in sentiment_tweets['negative'])
+            neutral = sum(1 for t in tw_list if t in sentiment_tweets['neutral'])
+    
+            # Generate metrics
+            polarity = (pos - neg) / 5
+            tw_pol = f"Positive: {pos} | Negative: {neg} | Neutral: {neutral}"
+            generate_sentiment_chart(pos, neg, neutral)
+        
+        # Get recommendation
+        idea, decision = recommending(df, polarity, today_stock, mean)
+        
+        print("tw_list:", tw_list)  # Should show []
+        # Prepare variables for rendering
+        return render_template('results.html', 
             quote=quote,
-            arima_pred=arima_pred,
-            lstm_pred=lstm_pred,
-            lr_pred=lr_pred,
-            open_s=str(today_stock['open'].iloc[0]),
-            close_s=str(today_stock['close'].iloc[0]),
-            adj_close=str(today_stock['adj close'].iloc[0]),
-            tw_list=tw_list,
-            tw_pol=f"Positive: {pos} | Negative: {neg} | Neutral: {neutral}",
-            idea=idea,
-            decision=decision,
-            high_s=str(today_stock['high'].iloc[0]),
-            low_s=str(today_stock['low'].iloc[0]),
-            vol=str(today_stock['volume'].iloc[0]),
+            arima_pred=round(arima_pred, 2),
+            lstm_pred=round(lstm_pred, 2),
+            lr_pred=round(lr_pred, 2),
+            open_s=today_stock['open'].to_string(index=False),  # Lowercase
+            close_s=today_stock['close'].to_string(index=False),  # Lowercase
+            adj_close=today_stock['adj close'].to_string(index=False),  # Lowercase (if exists)
+            tw_list=tw_list,  # ADD THIS LINE
+            tw_pol=tw_pol,    # ADD THIS LINE
+            idea=idea,        # ADD THIS LINE
+            decision=decision, # ADD THIS LINE
+            high_s=today_stock['high'].to_string(index=False),  # Lowercase
+            low_s=today_stock['low'].to_string(index=False),  # Lowercase
+            vol=today_stock['volume'].to_string(index=False),
             forecast_set=forecast_set,
-            error_lr=mock_error,
-            error_lstm=round(mock_error * 0.95, 2),
-            error_arima=round(mock_error * 1.1, 2)
+            error_lr=round(error_lr, 2),
+            error_lstm=round(error_lstm, 2),
+            error_arima=round(error_arima, 2)
         )
-
-    else:  # Original real code
-        try:
-            df = get_historical(quote)
-            if df.empty:
-                return render_template('index.html', error=True)
-            
-            df = pd.read_csv(f'{quote}.csv')
-            today_stock = df.iloc[-1:]
-        
-            # Run prediction algorithms
-            arima_pred, error_arima = ARIMA_ALGO(df)
-            lstm_pred, error_lstm = LSTM_ALGO(df)
-            df, lr_pred, forecast_set, mean, error_lr = LIN_REG_ALGO(df)
-        
-            # Get tweets and sentiment
-            tw_list = get_tweets(quote)
-            # ... rest of sentiment analysis from get_data...
-        
-            
-        except Exception as e:
-            print(f"Error: {str(e)}")
-            return render_template('index.html', error=True)
+    
+    except Exception as e:
+        print(f"Error: {str(e)}")  # Check server logs for this error
+        return render_template('index.html', error=True)  # Show error message on index
 
 # **************** ARIMA SECTION ********************
 def ARIMA_ALGO(df):
@@ -282,8 +280,7 @@ def ARIMA_ALGO(df):
         # Plot trends
         plt.figure(figsize=(7.2, 4.8), dpi=65)
         plt.plot(df['close'])
-        timestamp = str(int(time.time()))
-        plt.savefig(f'static/ARIMA_{timestamp}.png')
+        plt.savefig('static/Trends.png')
         plt.close()
 
         # Train-test split
@@ -531,47 +528,6 @@ from datetime import datetime, timedelta
 
 tweet_cache = {}
 
-def get_tweets(symbol):
-    DEMO_MODE = False  # Set to True to use mock data instead of CSV
-    TWEETS_CSV = 'tweets.csv'
-    MOCK_TWEETS = [
-        f"Breaking: {symbol} reaches new all-time high! 🚀",
-        f"Analysts bullish on {symbol}'s latest earnings report 📈",
-        f"{symbol} CEO announces major expansion plans 🌍",
-        f"Market reacts positively to {symbol}'s new product line 🤑",
-        f"{symbol} stock surges on strong quarterly results 💹",
-        f"Investors flock to {symbol} amid market volatility 🛡️"
-    ]
-
-    if DEMO_MODE:
-        return MOCK_TWEETS[:3]
-
-    try:
-        # Read from CSV file
-        tweets = []
-        with open(TWEETS_CSV, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['symbol'].upper() == symbol.upper():
-                    cleaned_tweet = re.sub(r'http\S+', '', row['tweet'])  # Remove URLs
-                    cleaned_tweet = cleaned_tweet.strip()
-                    if len(cleaned_tweet) > 0:
-                        tweets.append(cleaned_tweet)
-        
-        # If found in CSV, return latest 3 tweets
-        if tweets:
-            # Sort by date if needed (assuming date column exists)
-            return tweets[-3:]  # Return most recent 3 tweets
-        
-        # Fallback to mock data if no tweets found in CSV
-        return MOCK_TWEETS[:3]
-
-    except FileNotFoundError:
-        print(f"CSV file {TWEETS_CSV} not found. Using mock data.")
-        return MOCK_TWEETS[:3]
-    except Exception as e:
-        print(f"Error reading tweets from CSV: {str(e)}")
-        return MOCK_TWEETS[:3]
 def generate_sentiment_chart(pos, neg, neutral):
     plt.figure(figsize=(7.2, 4.8), dpi=65)
     labels = ['Positive', 'Negative', 'Neutral']
@@ -590,6 +546,46 @@ def generate_sentiment_chart(pos, neg, neutral):
     plt.axis('equal')
     plt.savefig('static/SA.png')
     plt.close()
+
+def get_tweets(symbol):
+    if symbol in tweet_cache:
+        cached_time, cached_tweets = tweet_cache[symbol]
+        if datetime.now() - cached_time < timedelta(minutes=15):
+            return cached_tweets
+    p.set_options(p.OPT.URL, p.OPT.EMOJI, p.OPT.SMILEY)
+    tweets = []
+    max_retries = 3  # Max attempts
+    retry_delay = 2  # Seconds (Twitter's rate limit window: 15 mins)
+    
+    if tweets:
+        tweet_cache[symbol] = (datetime.now(), tweets)
+    
+    for attempt in range(max_retries):
+        try:
+            # Fetch tweets
+            response = client.search_recent_tweets(
+                query=f"(${symbol} OR {symbol}) -is:retweet lang:en",
+                max_results=10,  # Reduced from 50 to avoid limits
+                tweet_fields=['created_at']
+            )
+            
+            if response.data:
+                for tweet in response.data:
+                    cleaned = p.clean(tweet.text)
+                    tweets.append(cleaned)
+                return tweets[:6]  # Return only 6 tweets to stay safe
+            return []
+            
+        except TooManyRequests:
+            print(f"Rate limit hit. Retrying in {retry_delay}s (Attempt {attempt+1}/{max_retries})")
+            time.sleep(retry_delay)
+            retry_delay *= 1  # Exponential backoff
+        except Exception as e:
+            print(f"Twitter Error: {str(e)}")
+            return []
+    
+    print("Max retries exceeded.")
+    return []
     
 
 # ****************GET DATA ***************************************
@@ -627,29 +623,75 @@ def get_data():
     # Twitter Lookup is no longer free
     #polarity, tw_list, tw_pol, pos, neg, neutral = 0, [], "Can't fetch tweets, Twitter Lookup is no longer free in API v2.", 0, 0, 0
     try:
-    # Initialize variables
-        polarity = 0.0
-        tw_list = []
-        tw_pol = "No tweets found"
-        pos = neg = neutral = 0
-
-    # Fetch tweets
         tw_list = get_tweets(quote)
-    
         if tw_list:
             analysis = [TextBlob(tweet).sentiment.polarity for tweet in tw_list]
-            polarity = sum(analysis) / len(analysis) if len(analysis) > 0 else 0
+            polarity = sum(analysis)/len(analysis)
             pos = len([x for x in analysis if x > 0])
             neg = len([x for x in analysis if x < 0])
             neutral = len([x for x in analysis if x == 0])
             tw_pol = f"Positive: {pos} | Negative: {neg} | Neutral: {neutral}"
-            generate_sentiment_chart(pos, neg, neutral)
         else:
-            generate_sentiment_chart(0, 0, 0)
-
+            # Fallback to demo tweets
+            raise Exception("No real tweets found")
     except Exception as e:
-        print(f"Twitter/Sentiment Error: {str(e)}")
-        tw_pol = "Error: Failed to fetch tweets"
+        print(f"Using demo tweets: {str(e)}")
+        
+        # DEMO TWEETS SYSTEM
+        sentiment_tweets = {
+            'positive': [
+                f"{quote} reaches new all-time high! 🚀",
+                f"Analysts raise price target for {quote} 📈",
+                f"{quote} announces major dividend increase 💰",
+                "Record quarterly earnings reported 🏆",
+                f"Institutional investors accumulating {quote} 🧑💼",
+                "New product launch exceeds expectations 🚀",
+                f"{quote} named sector leader by Wall Street 📰",
+                "CEO buys shares in open market 💹"
+            ],
+            'negative': [
+                f"{quote} faces SEC investigation 🔍",
+                "CFO unexpectedly resigns 😮",
+                f"{quote} misses revenue estimates 📉",
+                "Supply chain disruptions reported ⚠️",
+                f"Short sellers increasing positions in {quote} 📉",
+                "Product recall announced ⚠️",
+                "Credit rating downgrade issued 📉",
+                f"Lawsuits filed against {quote} ⚖️"
+            ],
+            'neutral':  [
+                f"{quote} to hold earnings call tomorrow 🎧",
+                "Sector-wide volatility continues 📊",
+                f"{quote} added to watchlist by major fund 👀",
+                "Technical analysis shows mixed signals 📈📉",
+                "Market awaits Fed decision 💼",
+                f"{quote} volume spikes with no clear catalyst 📊",
+                "Institutional ownership remains stable ⚖️",
+                f"Analysts debate {quote} valuation 🧑💻"
+            ]
+        }
+
+        # Random selection with varied sentiment
+        all_tweets = sentiment_tweets['positive'] + sentiment_tweets['negative'] + sentiment_tweets['neutral']
+        tw_list = random.choices(all_tweets, k=5)
+        random.shuffle(tw_list)
+        
+        # Create formatted reference lists
+        positive_ref = [t for t in sentiment_tweets['positive']]
+        negative_ref = [t for t in sentiment_tweets['negative']]
+        neutral_ref = [t for t in sentiment_tweets['neutral']]
+        
+        # Count sentiment distribution
+        pos = sum(1 for t in tw_list if t in positive_ref)
+        neg = sum(1 for t in tw_list if t in negative_ref)
+        neutral = sum(1 for t in tw_list if t in neutral_ref)
+        
+        # Generate polarity metrics
+        polarity = (pos - neg) / len(tw_list)  # Simple polarity calculation
+        tw_pol = f"DEMO DATA: Positive: {pos} | Negative: {neg} | Neutral: {neutral}"
+
+        # Generate sentiment chart
+        generate_sentiment_chart(pos, neg, neutral)
     
     # Get recommendation
     idea, decision = recommending(df, polarity, today_stock, mean)
@@ -684,4 +726,4 @@ os.environ['FLASK_DEBUG'] = '0'  # Force-disable debug mode
 os.environ['WERKZEUG_DEBUG_PIN'] = 'off'  # Disable debug PIN
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False, extra_files=[])
+    app.run(debug=False, use_reloader=False, extra_files=[])
